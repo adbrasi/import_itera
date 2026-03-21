@@ -1,4 +1,5 @@
 import os
+import json
 import threading
 import torch
 import numpy as np
@@ -10,6 +11,9 @@ SUPPORTED_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".webp", ".bmp",
     ".tiff", ".tif", ".gif", ".ico",
 }
+
+# JavaScript safe integer max (2^53 - 1)
+JS_MAX_SAFE_INT = 0x1FFFFFFFFFFFFF
 
 
 class ImageIterator:
@@ -38,7 +42,7 @@ class ImageIterator:
                 "seed": ("INT", {
                     "default": 0,
                     "min": 0,
-                    "max": 0xFFFFFFFFFFFFFFFF,
+                    "max": JS_MAX_SAFE_INT,
                     "tooltip": "Seed to trigger re-execution (use randomize)",
                 }),
                 "file_extensions": ("STRING", {
@@ -76,6 +80,14 @@ class ImageIterator:
         return exts if exts else SUPPORTED_EXTENSIONS
 
     @classmethod
+    def _validate_folder_path(cls, folder_path):
+        """Validate and resolve the folder path to prevent traversal attacks."""
+        resolved = os.path.realpath(folder_path)
+        if not os.path.isdir(resolved):
+            return None
+        return resolved
+
+    @classmethod
     def _scan_folder(cls, folder_path, extensions, sort_by):
         """Scan a folder and return a sorted list of image file paths."""
         if not os.path.isdir(folder_path):
@@ -84,11 +96,15 @@ class ImageIterator:
         files = []
         for f in os.listdir(folder_path):
             full_path = os.path.join(folder_path, f)
-            if not os.path.isfile(full_path):
+            # Ensure resolved path stays within the folder
+            real_path = os.path.realpath(full_path)
+            if not real_path.startswith(os.path.realpath(folder_path) + os.sep):
+                continue
+            if not os.path.isfile(real_path):
                 continue
             _, ext = os.path.splitext(f)
             if ext.lower() in extensions:
-                files.append(full_path)
+                files.append(real_path)
 
         if sort_by == "alphabetical":
             files.sort(key=lambda p: os.path.basename(p).lower())
@@ -107,14 +123,12 @@ class ImageIterator:
 
         with cls._lock:
             if unique_id in cls._cache_keys and cls._cache_keys[unique_id] == cache_key:
-                return cls._file_cache.get(unique_id, [])
+                return list(cls._file_cache.get(unique_id, []))
 
-        files = cls._scan_folder(folder_path, extensions, sort_by)
-
-        with cls._lock:
+            files = cls._scan_folder(folder_path, extensions, sort_by)
             cls._file_cache[unique_id] = files
             cls._cache_keys[unique_id] = cache_key
-        return files
+            return list(files)
 
     @classmethod
     def _invalidate_cache(cls, unique_id):
@@ -126,24 +140,25 @@ class ImageIterator:
     @staticmethod
     def _load_image(image_path):
         """Load an image file and return a ComfyUI-compatible IMAGE tensor."""
-        i = Image.open(image_path)
-        i = ImageOps.exif_transpose(i)
-        if i.mode == "I":
-            i = i.point(lambda v: v * (1.0 / 65535))
-            image = i.convert("RGB")
-            image = np.array(image).astype(np.float32)
-        else:
-            image = i.convert("RGB")
-            image = np.array(image).astype(np.float32) / 255.0
+        with Image.open(image_path) as i:
+            i = ImageOps.exif_transpose(i)
+            if i.mode == "I":
+                # 32-bit integer mode: convert to float first for safe normalization
+                arr = np.array(i).astype(np.float32) / 65535.0
+                image = np.stack([arr, arr, arr], axis=-1) if arr.ndim == 2 else arr
+            else:
+                image = i.convert("RGB")
+                image = np.array(image).astype(np.float32) / 255.0
         image = torch.from_numpy(image)[None,]
         return image
 
     def load_image(self, folder_path, index, seed, file_extensions, sort_by, unique_id=None):
-        if not folder_path or not os.path.isdir(folder_path):
+        resolved_path = self._validate_folder_path(folder_path)
+        if not resolved_path:
             raise ValueError(f"Invalid folder path: {folder_path}")
 
         uid = str(unique_id) if unique_id is not None else "default"
-        files = self._get_files(uid, folder_path, file_extensions, sort_by)
+        files = self._get_files(uid, resolved_path, file_extensions, sort_by)
 
         if not files:
             raise ValueError(f"No images found in '{folder_path}' with extensions '{file_extensions}'")
@@ -158,7 +173,6 @@ class ImageIterator:
 
         image = self._load_image(current_file)
 
-        # Send info to frontend
         info_text = f"[{current_index + 1}/{total}] {current_filename}"
         next_text = f"Next: {next_filename}" if total > 1 else "Next: (loop)"
 
@@ -182,7 +196,11 @@ class ImageIterator:
 
     @classmethod
     def IS_CHANGED(cls, folder_path, index, seed, file_extensions, sort_by, unique_id=None):
-        return (seed, index, folder_path, file_extensions, sort_by)
+        try:
+            folder_mtime = os.path.getmtime(folder_path)
+        except OSError:
+            folder_mtime = 0
+        return (seed, index, folder_path, file_extensions, sort_by, folder_mtime)
 
 
 # --- Custom API Routes ---
@@ -190,7 +208,11 @@ class ImageIterator:
 @PromptServer.instance.routes.post("/image_iterator/reset")
 async def reset_iterator(request):
     """Reset the iterator: clear cache and return index 0."""
-    data = await request.json()
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, Exception):
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+
     unique_id = str(data.get("node_id", ""))
 
     if unique_id:
@@ -201,11 +223,13 @@ async def reset_iterator(request):
 
 @PromptServer.instance.routes.get("/image_iterator/info/{node_id}")
 async def get_iterator_info(request):
-    """Get current cached info for a node."""
+    """Get current cached file count for a node."""
     node_id = request.match_info["node_id"]
-    files = ImageIterator._file_cache.get(node_id, [])
-    total = len(files)
-    filenames = [os.path.basename(f) for f in files] if files else []
+
+    with ImageIterator._lock:
+        files = ImageIterator._file_cache.get(node_id, [])
+        total = len(files)
+        filenames = [os.path.basename(f) for f in files]
 
     return web.json_response({
         "total": total,
