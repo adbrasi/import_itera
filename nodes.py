@@ -1,0 +1,213 @@
+import os
+import threading
+import torch
+import numpy as np
+from PIL import Image, ImageOps
+from aiohttp import web
+from server import PromptServer
+
+SUPPORTED_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp",
+    ".tiff", ".tif", ".gif", ".ico",
+}
+
+
+class ImageIterator:
+    """Loads images from a folder one at a time, iterating through them sequentially."""
+
+    # Class-level state: keyed by unique_id
+    _file_cache = {}  # {unique_id: [sorted list of file paths]}
+    _cache_keys = {}  # {unique_id: (folder_path, extensions, sort_by)} for invalidation
+    _lock = threading.Lock()
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "folder_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Absolute path to the folder containing images",
+                }),
+                "index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 999999,
+                    "step": 1,
+                    "tooltip": "Current image index (auto-incremented after each run)",
+                }),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xFFFFFFFFFFFFFFFF,
+                    "tooltip": "Seed to trigger re-execution (use randomize)",
+                }),
+                "file_extensions": ("STRING", {
+                    "default": "*.png,*.jpg,*.jpeg,*.webp",
+                    "tooltip": "Comma-separated list of extensions to filter (e.g. *.png,*.jpg)",
+                }),
+                "sort_by": (["alphabetical", "modified_date", "created_date"], {
+                    "default": "alphabetical",
+                    "tooltip": "How to sort the files in the folder",
+                }),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "INT", "INT")
+    RETURN_NAMES = ("image", "filename", "index", "total")
+    FUNCTION = "load_image"
+    CATEGORY = "image"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def _parse_extensions(cls, file_extensions):
+        """Parse the extensions string into a set of lowercase extensions."""
+        exts = set()
+        for ext in file_extensions.split(","):
+            ext = ext.strip().lower()
+            if ext.startswith("*."):
+                ext = ext[1:]  # remove the *
+            elif ext and not ext.startswith("."):
+                ext = "." + ext
+            if ext:
+                exts.add(ext)
+        return exts if exts else SUPPORTED_EXTENSIONS
+
+    @classmethod
+    def _scan_folder(cls, folder_path, extensions, sort_by):
+        """Scan a folder and return a sorted list of image file paths."""
+        if not os.path.isdir(folder_path):
+            return []
+
+        files = []
+        for f in os.listdir(folder_path):
+            full_path = os.path.join(folder_path, f)
+            if not os.path.isfile(full_path):
+                continue
+            _, ext = os.path.splitext(f)
+            if ext.lower() in extensions:
+                files.append(full_path)
+
+        if sort_by == "alphabetical":
+            files.sort(key=lambda p: os.path.basename(p).lower())
+        elif sort_by == "modified_date":
+            files.sort(key=lambda p: os.path.getmtime(p))
+        elif sort_by == "created_date":
+            files.sort(key=lambda p: os.path.getctime(p))
+
+        return files
+
+    @classmethod
+    def _get_files(cls, unique_id, folder_path, file_extensions, sort_by):
+        """Get file list from cache or scan the folder."""
+        extensions = cls._parse_extensions(file_extensions)
+        cache_key = (folder_path, frozenset(extensions), sort_by)
+
+        with cls._lock:
+            if unique_id in cls._cache_keys and cls._cache_keys[unique_id] == cache_key:
+                return cls._file_cache.get(unique_id, [])
+
+        files = cls._scan_folder(folder_path, extensions, sort_by)
+
+        with cls._lock:
+            cls._file_cache[unique_id] = files
+            cls._cache_keys[unique_id] = cache_key
+        return files
+
+    @classmethod
+    def _invalidate_cache(cls, unique_id):
+        """Force re-scan on next execution."""
+        with cls._lock:
+            cls._file_cache.pop(unique_id, None)
+            cls._cache_keys.pop(unique_id, None)
+
+    @staticmethod
+    def _load_image(image_path):
+        """Load an image file and return a ComfyUI-compatible IMAGE tensor."""
+        i = Image.open(image_path)
+        i = ImageOps.exif_transpose(i)
+        if i.mode == "I":
+            i = i.point(lambda v: v * (1.0 / 65535))
+            image = i.convert("RGB")
+            image = np.array(image).astype(np.float32)
+        else:
+            image = i.convert("RGB")
+            image = np.array(image).astype(np.float32) / 255.0
+        image = torch.from_numpy(image)[None,]
+        return image
+
+    def load_image(self, folder_path, index, seed, file_extensions, sort_by, unique_id=None):
+        if not folder_path or not os.path.isdir(folder_path):
+            raise ValueError(f"Invalid folder path: {folder_path}")
+
+        uid = str(unique_id) if unique_id is not None else "default"
+        files = self._get_files(uid, folder_path, file_extensions, sort_by)
+
+        if not files:
+            raise ValueError(f"No images found in '{folder_path}' with extensions '{file_extensions}'")
+
+        total = len(files)
+        current_index = index % total
+        next_index = (current_index + 1) % total
+
+        current_file = files[current_index]
+        current_filename = os.path.basename(current_file)
+        next_filename = os.path.basename(files[next_index])
+
+        image = self._load_image(current_file)
+
+        # Send info to frontend
+        info_text = f"[{current_index + 1}/{total}] {current_filename}"
+        next_text = f"Next: {next_filename}" if total > 1 else "Next: (loop)"
+
+        PromptServer.instance.send_sync("image_iterator.update", {
+            "node": unique_id,
+            "current_index": current_index,
+            "next_index": next_index,
+            "total": total,
+            "current_file": current_filename,
+            "next_file": next_filename,
+            "info": info_text,
+            "next_info": next_text,
+        })
+
+        return {
+            "ui": {
+                "text": [info_text, next_text],
+            },
+            "result": (image, current_filename, current_index, total),
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, folder_path, index, seed, file_extensions, sort_by, unique_id=None):
+        return (seed, index, folder_path, file_extensions, sort_by)
+
+
+# --- Custom API Routes ---
+
+@PromptServer.instance.routes.post("/image_iterator/reset")
+async def reset_iterator(request):
+    """Reset the iterator: clear cache and return index 0."""
+    data = await request.json()
+    unique_id = str(data.get("node_id", ""))
+
+    if unique_id:
+        ImageIterator._invalidate_cache(unique_id)
+
+    return web.json_response({"status": "ok", "index": 0})
+
+
+@PromptServer.instance.routes.get("/image_iterator/info/{node_id}")
+async def get_iterator_info(request):
+    """Get current cached info for a node."""
+    node_id = request.match_info["node_id"]
+    files = ImageIterator._file_cache.get(node_id, [])
+    total = len(files)
+    filenames = [os.path.basename(f) for f in files] if files else []
+
+    return web.json_response({
+        "total": total,
+        "files": filenames,
+    })
