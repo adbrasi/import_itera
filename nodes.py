@@ -195,12 +195,21 @@ class ImageIterator:
         }
 
     @classmethod
+    def VALIDATE_INPUTS(cls, folder_path, index, seed, file_extensions, sort_by, unique_id=None):
+        if not folder_path:
+            return "folder_path is required"
+        resolved = os.path.realpath(folder_path)
+        if not os.path.isdir(resolved):
+            return f"Folder not found: {folder_path}"
+        return True
+
+    @classmethod
     def IS_CHANGED(cls, folder_path, index, seed, file_extensions, sort_by, unique_id=None):
         try:
             folder_mtime = os.path.getmtime(folder_path)
         except OSError:
             folder_mtime = 0
-        return (seed, index, folder_path, file_extensions, sort_by, folder_mtime)
+        return f"{seed}:{index}:{folder_path}:{file_extensions}:{sort_by}:{folder_mtime}"
 
 
 # --- Custom API Routes ---
