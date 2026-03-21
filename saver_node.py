@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import numpy as np
 from PIL import Image
@@ -8,6 +9,24 @@ import comfy.cli_args
 
 # Counter state per node instance: {uid: counter, (uid, "start"): last_counter_start}
 _counters = {}
+
+
+def _find_max_counter(directory, prefix, ext):
+    """Scan directory (and subdirs) for existing files matching prefix_NNNNN.ext
+    and return the highest counter found, or -1 if none."""
+    pattern = re.compile(
+        re.escape(prefix) + r"_(\d{5})" + re.escape(ext) + "$",
+        re.IGNORECASE,
+    )
+    max_counter = -1
+    for dirpath, _dirs, filenames in os.walk(directory):
+        for f in filenames:
+            m = pattern.match(f)
+            if m:
+                c = int(m.group(1))
+                if c > max_counter:
+                    max_counter = c
+    return max_counter
 
 
 class BatchImageSaver:
@@ -162,18 +181,27 @@ class BatchImageSaver:
             os.makedirs(resolved_path, exist_ok=True)
 
         uid = str(unique_id) if unique_id is not None else "default"
+        ext = self._get_extension(format)
 
-        # Initialize or reset counter when counter_start changes
+        # Determine next counter: scan disk for existing files to avoid overwrite
         last_start = _counters.get((uid, "start"))
         if uid not in _counters or last_start != counter_start:
-            _counters[uid] = counter_start
+            # First run or counter_start changed: scan disk
+            disk_max = _find_max_counter(resolved_path, prefix, ext)
+            counter = max(counter_start, disk_max + 1)
+            _counters[uid] = counter
             _counters[(uid, "start")] = counter_start
-        counter = _counters[uid]
+        else:
+            counter = _counters[uid]
+            # Safety: still check disk in case files were added externally
+            disk_max = _find_max_counter(resolved_path, prefix, ext)
+            if disk_max >= counter:
+                counter = disk_max + 1
+                _counters[uid] = counter
 
         # Build PNG metadata (prompt + workflow info)
         metadata = self._build_png_metadata(prompt, extra_pnginfo) if format == "png" else None
 
-        ext = self._get_extension(format)
         filename = f"{prefix}_{counter:05d}{ext}"
         saved_files = []
         saved_count = 0
