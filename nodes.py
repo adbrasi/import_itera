@@ -89,22 +89,21 @@ class ImageIterator:
 
     @classmethod
     def _scan_folder(cls, folder_path, extensions, sort_by):
-        """Scan a folder and return a sorted list of image file paths."""
+        """Scan a folder recursively and return a sorted list of image file paths."""
         if not os.path.isdir(folder_path):
             return []
 
+        resolved_root = os.path.realpath(folder_path)
         files = []
-        for f in os.listdir(folder_path):
-            full_path = os.path.join(folder_path, f)
-            # Ensure resolved path stays within the folder
-            real_path = os.path.realpath(full_path)
-            if not real_path.startswith(os.path.realpath(folder_path) + os.sep):
-                continue
-            if not os.path.isfile(real_path):
-                continue
-            _, ext = os.path.splitext(f)
-            if ext.lower() in extensions:
-                files.append(real_path)
+        for dirpath, _dirnames, filenames in os.walk(resolved_root):
+            for f in filenames:
+                full_path = os.path.join(dirpath, f)
+                real_path = os.path.realpath(full_path)
+                if not real_path.startswith(resolved_root + os.sep):
+                    continue
+                _, ext = os.path.splitext(f)
+                if ext.lower() in extensions:
+                    files.append(real_path)
 
         if sort_by == "alphabetical":
             files.sort(key=lambda p: os.path.basename(p).lower())
