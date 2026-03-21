@@ -22,6 +22,8 @@ class ImageIterator:
     # Class-level state: keyed by unique_id
     _file_cache = {}  # {unique_id: [sorted list of file paths]}
     _cache_keys = {}  # {unique_id: (folder_path, extensions, sort_by)} for invalidation
+    _internal_index = {}  # {unique_id: current server-side index}
+    _last_widget_index = {}  # {unique_id: last seen widget index value}
     _lock = threading.Lock()
 
     @classmethod
@@ -131,10 +133,12 @@ class ImageIterator:
 
     @classmethod
     def _invalidate_cache(cls, unique_id):
-        """Force re-scan on next execution."""
+        """Force re-scan and reset index on next execution."""
         with cls._lock:
             cls._file_cache.pop(unique_id, None)
             cls._cache_keys.pop(unique_id, None)
+            cls._internal_index.pop(unique_id, None)
+            cls._last_widget_index.pop(unique_id, None)
 
     @staticmethod
     def _load_image(image_path):
@@ -163,8 +167,23 @@ class ImageIterator:
             raise ValueError(f"No images found in '{folder_path}' with extensions '{file_extensions}'")
 
         total = len(files)
-        current_index = index % total
-        next_index = (current_index + 1) % total
+
+        # Server-side index management: independent of frontend widget
+        with self._lock:
+            last_widget = self._last_widget_index.get(uid)
+            if uid not in self._internal_index:
+                # First run: use widget value as starting point
+                self._internal_index[uid] = index % total
+            elif last_widget is not None and index != last_widget:
+                # User manually changed the widget index: respect it
+                self._internal_index[uid] = index % total
+
+            current_index = self._internal_index[uid] % total
+            next_index = (current_index + 1) % total
+
+            # Auto-increment for next execution
+            self._internal_index[uid] = next_index
+            self._last_widget_index[uid] = index
 
         current_file = files[current_index]
         current_filename = os.path.basename(current_file)
@@ -204,11 +223,8 @@ class ImageIterator:
 
     @classmethod
     def IS_CHANGED(cls, folder_path, index, seed, file_extensions, sort_by, unique_id=None):
-        try:
-            folder_mtime = os.path.getmtime(folder_path)
-        except OSError:
-            folder_mtime = 0
-        return f"{seed}:{index}:{folder_path}:{file_extensions}:{sort_by}:{folder_mtime}"
+        # Always re-execute: server-side index auto-increments independently
+        return float("NaN")
 
 
 # --- Custom API Routes ---
