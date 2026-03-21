@@ -97,7 +97,8 @@ class ImageIterator:
 
         resolved_root = os.path.realpath(folder_path)
         files = []
-        for dirpath, _dirnames, filenames in os.walk(resolved_root):
+        for dirpath, dirnames, filenames in os.walk(resolved_root):
+            dirnames.sort()  # Deterministic subdirectory traversal order
             for f in filenames:
                 full_path = os.path.join(dirpath, f)
                 real_path = os.path.realpath(full_path)
@@ -108,11 +109,12 @@ class ImageIterator:
                     files.append(real_path)
 
         if sort_by == "alphabetical":
-            files.sort(key=lambda p: os.path.basename(p).lower())
+            # Sort by full path for deterministic ordering across subdirectories
+            files.sort(key=lambda p: p.lower())
         elif sort_by == "modified_date":
-            files.sort(key=lambda p: os.path.getmtime(p))
+            files.sort(key=lambda p: (os.path.getmtime(p), p.lower()))
         elif sort_by == "created_date":
-            files.sort(key=lambda p: os.path.getctime(p))
+            files.sort(key=lambda p: (os.path.getctime(p), p.lower()))
 
         return files
 
@@ -120,7 +122,11 @@ class ImageIterator:
     def _get_files(cls, unique_id, folder_path, file_extensions, sort_by):
         """Get file list from cache or scan the folder."""
         extensions = cls._parse_extensions(file_extensions)
-        cache_key = (folder_path, frozenset(extensions), sort_by)
+        try:
+            folder_mtime = os.path.getmtime(folder_path)
+        except OSError:
+            folder_mtime = 0
+        cache_key = (folder_path, frozenset(extensions), sort_by, folder_mtime)
 
         with cls._lock:
             if unique_id in cls._cache_keys and cls._cache_keys[unique_id] == cache_key:
@@ -186,8 +192,24 @@ class ImageIterator:
             self._last_widget_index[uid] = index
 
         current_file = files[current_index]
-        current_filename = os.path.basename(current_file)
-        next_filename = os.path.basename(files[next_index])
+
+        # Fallback: if cached file was deleted, re-scan and retry
+        if not os.path.isfile(current_file):
+            self._invalidate_cache(uid)
+            files = self._get_files(uid, resolved_path, file_extensions, sort_by)
+            if not files:
+                raise ValueError(f"No images found in '{folder_path}'")
+            total = len(files)
+            with self._lock:
+                self._internal_index[uid] = self._internal_index.get(uid, 0) % total
+                current_index = self._internal_index[uid]
+                next_index = (current_index + 1) % total
+                self._internal_index[uid] = next_index
+            current_file = files[current_index]
+
+        # Use relative path for display (distinguishes files in different subdirs)
+        current_filename = os.path.relpath(current_file, resolved_path)
+        next_filename = os.path.relpath(files[next_index % len(files)], resolved_path)
 
         image = self._load_image(current_file)
 
