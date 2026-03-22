@@ -23,7 +23,6 @@ class ImageIterator:
     _file_cache = {}  # {unique_id: [sorted list of file paths]}
     _cache_keys = {}  # {unique_id: (folder_path, extensions, sort_by)} for invalidation
     _internal_index = {}  # {unique_id: current server-side index}
-    _last_widget_index = {}  # {unique_id: last seen widget index value}
     _lock = threading.Lock()
 
     @classmethod
@@ -144,7 +143,6 @@ class ImageIterator:
             cls._file_cache.pop(unique_id, None)
             cls._cache_keys.pop(unique_id, None)
             cls._internal_index.pop(unique_id, None)
-            cls._last_widget_index.pop(unique_id, None)
 
     @staticmethod
     def _load_image(image_path):
@@ -174,14 +172,13 @@ class ImageIterator:
 
         total = len(files)
 
-        # Server-side index management: independent of frontend widget
+        # Server-side index management: fully independent of frontend widget
+        # The widget "index" is ONLY used as starting point on first run.
+        # After that, the server auto-increments independently.
+        # Use Reset button to restart from 0.
         with self._lock:
-            last_widget = self._last_widget_index.get(uid)
             if uid not in self._internal_index:
                 # First run: use widget value as starting point
-                self._internal_index[uid] = index % total
-            elif last_widget is not None and index != last_widget:
-                # User manually changed the widget index: respect it
                 self._internal_index[uid] = index % total
 
             current_index = self._internal_index[uid] % total
@@ -189,7 +186,6 @@ class ImageIterator:
 
             # Auto-increment for next execution
             self._internal_index[uid] = next_index
-            self._last_widget_index[uid] = index
 
         current_file = files[current_index]
 

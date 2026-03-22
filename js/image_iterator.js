@@ -29,10 +29,10 @@ app.registerExtension({
                 infoWidget.value = `${data.info}\n${data.next_info}`;
             }
 
-            const indexWidget = node.widgets?.find((w) => w.name === "index");
-            if (indexWidget) {
-                indexWidget.value = data.next_index;
-            }
+            // DO NOT update the index widget here — index is managed
+            // server-side. Updating the widget causes desync with auto-queue
+            // (the new widget value gets serialized into the next prompt,
+            // triggering the "manual override" detection and resetting the index).
 
             node.setDirtyCanvas(true, true);
         });
