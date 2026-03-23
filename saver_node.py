@@ -64,6 +64,11 @@ class BatchImageSaver:
                 }),
             },
             "optional": {
+                "filename_override": ("STRING", {
+                    "default": "",
+                    "forceInput": True,
+                    "tooltip": "If provided, saves with this exact filename (ignores prefix/counter/format). Connect the 'filename' output from Iterator/Loader.",
+                }),
                 "subfolder_1": ("STRING", {"default": ""}),
                 "subfolder_2": ("STRING", {"default": ""}),
                 "subfolder_3": ("STRING", {"default": ""}),
@@ -181,28 +186,42 @@ class BatchImageSaver:
             os.makedirs(resolved_path, exist_ok=True)
 
         uid = str(unique_id) if unique_id is not None else "default"
-        ext = self._get_extension(format)
+        filename_override = kwargs.pop("filename_override", None) or ""
+        filename_override = filename_override.strip()
 
-        # Determine next counter: scan disk for existing files to avoid overwrite
-        last_start = _counters.get((uid, "start"))
-        if uid not in _counters or last_start != counter_start:
-            # First run or counter_start changed: scan disk
-            disk_max = _find_max_counter(resolved_path, prefix, ext)
-            counter = max(counter_start, disk_max + 1)
-            _counters[uid] = counter
-            _counters[(uid, "start")] = counter_start
+        if filename_override:
+            # Use the exact filename provided (from Iterator/Loader output)
+            filename = filename_override
+            # Detect format from the override extension for save logic
+            _, override_ext = os.path.splitext(filename)
+            override_ext = override_ext.lower()
+            if override_ext in (".jpg", ".jpeg"):
+                save_fmt = "jpg"
+            elif override_ext in (".webp",):
+                save_fmt = "webp"
+            else:
+                save_fmt = "png"
+            metadata = self._build_png_metadata(prompt, extra_pnginfo) if save_fmt == "png" else None
         else:
-            counter = _counters[uid]
-            # Safety: still check disk in case files were added externally
-            disk_max = _find_max_counter(resolved_path, prefix, ext)
-            if disk_max >= counter:
-                counter = disk_max + 1
+            # Normal counter-based naming
+            ext = self._get_extension(format)
+            save_fmt = format
+
+            last_start = _counters.get((uid, "start"))
+            if uid not in _counters or last_start != counter_start:
+                disk_max = _find_max_counter(resolved_path, prefix, ext)
+                counter = max(counter_start, disk_max + 1)
                 _counters[uid] = counter
+                _counters[(uid, "start")] = counter_start
+            else:
+                counter = _counters[uid]
+                disk_max = _find_max_counter(resolved_path, prefix, ext)
+                if disk_max >= counter:
+                    counter = disk_max + 1
+                    _counters[uid] = counter
 
-        # Build PNG metadata (prompt + workflow info)
-        metadata = self._build_png_metadata(prompt, extra_pnginfo) if format == "png" else None
-
-        filename = f"{prefix}_{counter:05d}{ext}"
+            metadata = self._build_png_metadata(prompt, extra_pnginfo) if format == "png" else None
+            filename = f"{prefix}_{counter:05d}{ext}"
         saved_files = []
         saved_count = 0
 
@@ -241,17 +260,17 @@ class BatchImageSaver:
             os.makedirs(real_target, exist_ok=True)
 
             # Convert and save (PNG and WebP support alpha via mask)
-            has_mask = mask is not None and format in ("png", "webp")
+            has_mask = mask is not None and save_fmt in ("png", "webp")
             pil_image = self._tensor_to_pil(image, mask if has_mask else None)
 
             filepath = os.path.join(real_target, filename)
-            self._save_pil_image(pil_image, filepath, format, quality, metadata)
+            self._save_pil_image(pil_image, filepath, save_fmt, quality, metadata)
 
             saved_files.append(f"  [{i}] {os.path.relpath(filepath, resolved_path)}")
             saved_count += 1
 
-        # Only increment counter if at least one image was saved
-        if saved_count > 0:
+        # Only increment counter if at least one image was saved (skip for filename_override)
+        if saved_count > 0 and not filename_override:
             _counters[uid] = counter + 1
 
         # Build info text
